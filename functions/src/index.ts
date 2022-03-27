@@ -6,39 +6,61 @@ import * as express from "express";
 import {https} from "firebase-functions";
 import {PubSub} from "@google-cloud/pubsub";
 import {firestore} from "firebase-admin";
-import CollectionReference = firestore.CollectionReference;
-import DocumentData = firestore.DocumentData;
-import WriteResult = firestore.WriteResult;
 
-const TELEMETRY_TOPIC = "telemetry";
+const IOT_EVENTS_TOPIC = "iot-events";
 const REGION = "australia-southeast1";
 const RETENTION_PERIOD_SEC = 7 * 24 * 60 * 60;
 
 
 /**
- * Deletes old Firestore entries
- *
- * @param {CollectionReference<DocumentData>} db This is the reference to the db path to delete from.
+ * Helper function that will delete entries older than RETENTION_PERIOD_SEC
  */
-async function deleteOldEntries(db: CollectionReference<DocumentData>): Promise<WriteResult[]> {
-  // Now delete old entries
-  const batch = firestore().batch();
+const trimRecords = async () : Promise<void> => {
   const epochNowSec = Date.now().valueOf() / 1000;
   const oldestEpoch = epochNowSec - RETENTION_PERIOD_SEC;
-  const queryResult = await db.orderBy("timestamp").where("timestamp", "<=", oldestEpoch).get();
-  queryResult.forEach((entry) =>{
-    batch.delete(entry.ref);
-    console.log(`Deleting ${entry.data().timestamp}`);
-  });
+  functions.logger.info(`Deleting records older than epoch ${oldestEpoch}`);
+  const collections = await firestore().listCollections();
+  for (const collection of collections) {
+    const docs = await collection.listDocuments();
+    // Batch all queries
+    const batch = firestore().batch();
+    for (const doc of docs) {
+      const db = doc.collection(IOT_EVENTS_TOPIC).doc("telemetry").collection("events");
+      const query = await db.where("timestamp", "<=", oldestEpoch).get();
+      query.forEach((entry) => {
+        batch.delete(entry.ref);
+      });
 
-  return await batch.commit();
-}
+      await batch.commit();
+      functions.logger.info(`Deleted ${query.size} documents for ${doc.id}`);
+    }
+  }
+  return Promise.resolve();
+};
+
+/**
+ * Test function to trim records
+ */
+exports.testTrimDocuments = functions.region(REGION)
+    .https
+    .onRequest((req: https.Request, resp: express.Response) : Promise<void> => {
+      return trimRecords();
+    });
+
+/**
+ * Periodic handler which will trim the firestore DB to make sure it doesn't grow out of hand
+ */
+exports.trimTelemetryDocuments = functions.region(REGION)
+    .pubsub.schedule("every 24 hours").onRun((context) => {
+      return trimRecords();
+    });
+
 /**
  * Handles inbound telemetry payloads, processes them and stores them as required
  */
-exports.handleTelemetryPayload =
+exports.handleIotEventsPayload =
     functions.region(REGION)
-        .pubsub.topic(TELEMETRY_TOPIC)
+        .pubsub.topic(IOT_EVENTS_TOPIC)
         .onPublish((message) : Promise<void> => {
           try {
             const payload = JSON.stringify(message.json);
@@ -49,16 +71,15 @@ exports.handleTelemetryPayload =
             const db = firestore()
                 .collection(message.attributes.deviceRegistryId)
                 .doc(message.attributes.deviceId)
-                .collection(`${TELEMETRY_TOPIC}`)
+                .collection(`${IOT_EVENTS_TOPIC}`)
                 .doc(`${message.attributes.subFolder}`)
-                .collection("messages");
+                .collection("events");
+
             // Add new entry
             db.doc(`${message.json.timestamp}`)
                 .set(message.json)
                 .then(() => {
-                  deleteOldEntries(db).then( () =>{
-                    return Promise.resolve();
-                  });
+                  return Promise.resolve();
                 }).catch((reason) => {
                   return Promise.reject(reason);
                 });
@@ -77,7 +98,6 @@ exports.handleTelemetryPayload =
 
           return Promise.resolve();
         });
-
 
 /**
  * Used for testing so we can generate valid payloads
@@ -104,11 +124,10 @@ exports.generateTestTelemetryPayload = functions.region(REGION)
         brew_temp: 67.5,
       }));
 
-      pubsub.topic(TELEMETRY_TOPIC).publishMessage({data, attributes, json: true}).then((value) => {
-        console.log(value); // Success!
+      pubsub.topic(IOT_EVENTS_TOPIC).publishMessage({data, attributes, json: true}).then((value) => {
         resp.sendStatus(200);
       }).catch((reason) => {
-        functions.logger.error(`Failed to publish to topic ${TELEMETRY_TOPIC}, ${reason}`);
+        functions.logger.error(`Failed to publish to topic ${IOT_EVENTS_TOPIC}, ${reason}`);
         resp.sendStatus(500);
       });
 
