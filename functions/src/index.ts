@@ -12,6 +12,7 @@ import * as express from "express";
  * Periodic handler which will trim the firestore DB to make sure it doesn't grow out of hand
  */
 exports.trimTelemetryDocuments = functions.region(REGION)
+    .runWith({timeoutSeconds: 300, memory: "512MB"})
     .pubsub.schedule("every 24 hours").onRun((context) => {
       return trimRecords();
     });

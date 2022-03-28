@@ -20,18 +20,24 @@ export const trimRecords = async (): Promise<void> => {
 
   for (const collection of collections) {
     const docs = await collection.listDocuments();
+
     // Batch all queries
     for (const doc of docs) {
-      const batch = firestore().batch();
       const db = doc.collection(IOT_EVENTS_TOPIC).doc("telemetry").collection("events");
+      let querySize = 0;
+      let totalCount = 0;
+      do {
+        const batch = firestore().batch();
+        const query = await db.where("timestamp", "<=", oldestEpoch).limit(500).get();
+        querySize = query.size;
+        totalCount += querySize;
+        query.forEach((entry) => {
+          batch.delete(entry.ref);
+        });
 
-      const query = await db.where("timestamp", "<=", oldestEpoch).get();
-      query.forEach((entry) => {
-        batch.delete(entry.ref);
-      });
-
-      functions.logger.info(`Deleting ${query.size} documents for ${doc.id}`);
-      await batch.commit();
+        await batch.commit();
+      } while (querySize > 0);
+      functions.logger.info(`Deleted ${totalCount} documents for ${doc.id}`);
     }
   }
 
